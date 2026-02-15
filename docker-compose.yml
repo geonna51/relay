@@ -1,0 +1,23 @@
+services:
+  scheduler:
+    build: .
+    command: ["server", "--host", "0.0.0.0", "--port", "8000", "--db", "/data/relay.db"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - relay-data:/data
+
+  worker-1:
+    build: .
+    command: ["worker", "--server", "http://scheduler:8000", "--id", "worker-01", "--cpus", "4", "--ram", "8192"]
+    depends_on:
+      - scheduler
+
+  worker-2:
+    build: .
+    command: ["worker", "--server", "http://scheduler:8000", "--id", "worker-02", "--cpus", "4", "--ram", "8192"]
+    depends_on:
+      - scheduler
+
+volumes:
+  relay-data:

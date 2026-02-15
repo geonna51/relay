@@ -1,0 +1,38 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed job scheduler with worker pull model, heartbeats, lease management, and fault tolerance."
+authors = ["George <uchennanyelugo@gmail.com>"]
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["json"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.33"
+rand = "0.9"
+thiserror = "2"
+tempfile = "3"
+
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+
+[[bin]]
+name = "relay-server"
+path = "src/bin/relay_server.rs"
+
+[[bin]]
+name = "relay-worker"
+path = "src/bin/relay_worker.rs"
