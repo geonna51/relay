@@ -130,6 +130,7 @@ impl Scheduler {
             stdout: None,
             stderr: None,
             runtime_ms: None,
+            scheduling_latency_ms: None,
         };
 
         self.store.save_job(&job)?;

@@ -64,7 +64,7 @@ Relay consists of three components:
 
 1. **Client**: Issues HTTP requests to the scheduler to submit commands, query execution progress, or retrieve logs.
 2. **Scheduler**: Manages queue ordering, tracks worker heartbeats, issues job leases, records attempts, and stores state in a local SQLite database with write-ahead logging (WAL).
-3. **Workers**: Workers pull tasks from the scheduler rather than receiving push connections. When a worker has available CPU and memory capacity, it requests work. When assigned a job, the worker spawns the command as a subprocess, periodically renews the lease, and streams stdout/stderr to disk files (`o/out.<job_id>`).
+3. **Workers**: Workers pull tasks from the scheduler rather than receiving push connections. When a worker has available CPU and memory capacity, it requests work. When assigned a job, the worker spawns the command as a subprocess, dynamically tracks resource allocation, periodically renews the lease, and streams stdout/stderr line-by-line to disk files (`o/out.<job_id>`) in real time.
 
 ## Failure behavior
 
@@ -78,6 +78,16 @@ When a worker receives a job, the scheduler issues a lease (default: 30 seconds)
 
 ### Stale attempt rejection
 Every job assignment receives a unique attempt identifier. If Worker A loses connectivity, its lease expires, and the job is reassigned to Worker B (Attempt 2). If Worker A later reconnects and reports completion for Attempt 1, the scheduler checks the attempt ID, identifies it as superseded, and discards the result.
+
+### Job cancellation
+When a user cancels a job:
+1. The job transitions immediately to `CANCELLED`.
+2. Active leases are deleted from SQLite.
+3. The job's `current_attempt_id` and `worker_id` are cleared (`NULL`).
+4. If an in-flight worker finishes the command after cancellation and attempts to report completion, the scheduler identifies the attempt as stale or the job as terminal, rejects the update (`stale_ignored`), and preserves the `CANCELLED` status.
+
+### Dynamic resource allocation
+Workers track currently allocated CPUs and memory across active subprocesses. Polling requests specify only unallocated capacity. Within a polling batch, the scheduler deducts required resources per claimed candidate, preventing multiple resource-intensive jobs from saturating a single worker.
 
 ### Job failures and retries
 If a command exits with a non-zero code or times out:
@@ -140,7 +150,7 @@ Terminal 4 (CLI):
 
 ## Tests
 
-Integration tests cover end-to-end execution, failure recovery, lease expiration, DAG dependency resolution, and stale attempt rejection:
+Integration tests cover end-to-end execution, failure recovery, lease expiration, DAG dependency resolution, resource allocation, and stale attempt rejection:
 
 ```bash
 cargo test --all
@@ -149,6 +159,9 @@ cargo test --all
 Test coverage:
 - `tests/test_e2e.rs`: Submitting a command, worker pulling work, subprocess execution, log collection, and completion.
 - `tests/test_leases.rs`: Worker abandonment, heartbeat expiration, lease reclamation, and reassignment to an alternate worker.
+- `tests/test_cancellation.rs`: Late worker completions arriving after job cancellation are rejected as stale attempts without resurrecting terminal state.
+- `tests/test_resources.rs`: Batch claim resource accounting preventing single workers from being oversaturated.
+- `tests/test_streaming_logs.rs`: Real-time streaming log lines flushed to disk prior to child process exit.
 - `tests/test_stale_attempts.rs`: Network partition simulation verifying stale attempt reports are rejected.
 - `tests/test_dag.rs`: Blocked jobs held until upstream dependencies complete.
 - `tests/test_retries.rs`: Subprocess failure, backoff delay, and transition to terminal failed state after exhausting retries.
@@ -170,16 +183,19 @@ Measured on Apple M3 Pro (12 cores, 18 GB RAM), macOS 15, build target `release`
 ./target/release/relay benchmark --jobs 1000 --workers 8
 ```
 
-Results:
+Results distinguish between **Submission Latency** (local SQLite persistence time) and **Scheduling Latency** (duration from job creation to worker assignment):
 
 | Metric | Measured Value |
 | :--- | :--- |
 | Workload | 1,000 POSIX subprocess tasks |
 | Workers | 8 local worker daemons |
-| Total Duration | 38.2 s |
-| Scheduling Latency (p50) | 0.11 ms |
-| Scheduling Latency (p95) | 0.28 ms |
-| Scheduling Latency (p99) | 1.25 ms |
+| Throughput | 1,158 jobs/sec |
+| Submission Latency (p50) | 0.17 ms |
+| Submission Latency (p95) | 2.92 ms |
+| Submission Latency (p99) | 13.95 ms |
+| Scheduling Latency (p50) | 5.55 ms |
+| Scheduling Latency (p95) | 24.18 ms |
+| Scheduling Latency (p99) | 26.36 ms |
 | Worker Failures Requeued | Handled with 0 lost jobs |
 
 ## Limitations

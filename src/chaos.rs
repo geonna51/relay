@@ -110,27 +110,30 @@ pub async fn run_chaos_test(config: ChaosConfig) -> Result<ChaosReport, Box<dyn 
         sleep(kill_interval).await;
 
         let victim_idx = rng.random_range(0..worker_controls.len());
-        let (worker_id, daemon, _) = &worker_controls[victim_idx];
+        let victim_id = worker_controls[victim_idx].0.clone();
 
-        warn!("[CHAOS] Injecting failure: Killing {}", worker_id);
-        daemon.stop();
+        warn!("[CHAOS] Injecting failure: Abruptly killing {}", victim_id);
+        // daemon.kill() aborts heartbeat loop, execution tasks, and active lease renewals immediately
+        worker_controls[victim_idx].1.kill();
+        worker_controls[victim_idx].2.abort();
         workers_killed += 1;
 
-        let server_url_revive = server_url.clone();
-        let revived_id = worker_id.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(1500)).await;
-            info!("[CHAOS] Reviving {}", revived_id);
-            let mut w_cfg = WorkerConfig::default();
-            w_cfg.worker_id = revived_id;
-            w_cfg.scheduler_url = server_url_revive;
-            w_cfg.heartbeat_interval = Duration::from_millis(500);
-            w_cfg.renew_interval = Duration::from_millis(800);
-            w_cfg.poll_interval = Duration::from_millis(200);
+        sleep(Duration::from_millis(1500)).await;
+        info!("[CHAOS] Reviving {}", victim_id);
+        let mut w_cfg = WorkerConfig::default();
+        w_cfg.worker_id = victim_id.clone();
+        w_cfg.scheduler_url = server_url.clone();
+        w_cfg.heartbeat_interval = Duration::from_millis(500);
+        w_cfg.renew_interval = Duration::from_millis(800);
+        w_cfg.poll_interval = Duration::from_millis(200);
 
-            let new_daemon = WorkerDaemon::new(w_cfg);
-            let _ = new_daemon.run().await;
+        let new_daemon = Arc::new(WorkerDaemon::new(w_cfg));
+        let new_daemon_clone = Arc::clone(&new_daemon);
+        let new_handle = tokio::spawn(async move {
+            let _ = new_daemon_clone.run().await;
         });
+
+        worker_controls[victim_idx] = (victim_id, new_daemon, new_handle);
 
         let metrics = store.get_metrics()?;
         if metrics.jobs_succeeded + metrics.jobs_failed >= config.num_jobs {
@@ -173,6 +176,11 @@ pub async fn run_chaos_test(config: ChaosConfig) -> Result<ChaosReport, Box<dyn 
         report.workers_killed,
         report.total_duration.as_secs_f64()
     );
+
+    for (_, daemon, handle) in worker_controls {
+        daemon.kill();
+        handle.abort();
+    }
 
     Ok(report)
 }
