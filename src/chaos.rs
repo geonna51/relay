@@ -113,7 +113,6 @@ pub async fn run_chaos_test(config: ChaosConfig) -> Result<ChaosReport, Box<dyn 
         let victim_id = worker_controls[victim_idx].0.clone();
 
         warn!("[CHAOS] Injecting failure: Abruptly killing {}", victim_id);
-        // daemon.kill() aborts heartbeat loop, execution tasks, and active lease renewals immediately
         worker_controls[victim_idx].1.kill();
         worker_controls[victim_idx].2.abort();
         workers_killed += 1;

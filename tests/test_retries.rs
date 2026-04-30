@@ -16,7 +16,6 @@ async fn test_max_retries_and_failure() {
     let sched_config = SchedulerConfig::default();
     let scheduler = Scheduler::new(store.clone(), sched_config);
 
-    // Job with max_retries = 1 (can only retry once, total 2 attempts)
     let sub = scheduler
         .submit_job(SubmitJobRequest {
             command: "exit 1".to_string(),
@@ -38,7 +37,6 @@ async fn test_max_retries_and_failure() {
         labels: HashMap::new(),
     };
 
-    // Attempt 1
     let claimed_1 = store.claim_jobs("worker-1", &cap, 1, Duration::from_secs(10)).unwrap();
     assert_eq!(claimed_1.len(), 1);
     let att_1_id = claimed_1[0].1.id.clone();
@@ -61,10 +59,9 @@ async fn test_max_retries_and_failure() {
     assert_eq!(job_after_1.status, JobStatus::Retrying);
     assert_eq!(job_after_1.retry_count, 1);
 
-    // Wait for backoff to elapse (2^1 = 2 seconds)
+    // Wait out exponential backoff (2s)
     sleep(Duration::from_millis(2100)).await;
 
-    // Attempt 2 (retry claimed)
     let claimed_2 = store.claim_jobs("worker-1", &cap, 1, Duration::from_secs(10)).unwrap();
     assert_eq!(claimed_2.len(), 1);
     let att_2_id = claimed_2[0].1.id.clone();
@@ -84,7 +81,6 @@ async fn test_max_retries_and_failure() {
 
     assert_eq!(res_2.status, "accepted");
 
-    // Now max_retries (1) has been reached -> Final status FAILED
     let job_final = store.get_job(&sub.job_id).unwrap().unwrap();
     assert_eq!(job_final.status, JobStatus::Failed);
     assert_eq!(job_final.exit_code, Some(1));

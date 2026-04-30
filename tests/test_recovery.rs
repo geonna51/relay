@@ -15,7 +15,6 @@ async fn test_scheduler_crash_recovery() {
     let job_id_1;
     let job_id_2;
 
-    // Run scheduler 1
     {
         let store = Arc::new(Store::new(&db_path).unwrap());
         let sched = Scheduler::new(store.clone(), SchedulerConfig::default());
@@ -52,35 +51,27 @@ async fn test_scheduler_crash_recovery() {
             .unwrap();
         job_id_2 = j2.job_id;
 
-        // Claim job 1 with a short lease
         let cap = WorkerCapacity {
             cpus: 2,
             memory_mb: 2048,
             labels: HashMap::new(),
         };
         let _ = store.claim_jobs("worker-crash", &cap, 1, Duration::from_millis(200)).unwrap();
-
-        // Job 2 remains Queued
-        // Now simulate scheduler crash: drop store and scheduler!
     }
 
-    // Wait for the active lease of job 1 to expire in real time (> 200ms)
+    // Wait for lease of job 1 to expire across the downtime
     sleep(Duration::from_millis(400)).await;
 
-    // Scheduler 2 restarts with the same database
     {
         let store2 = Arc::new(Store::new(&db_path).unwrap());
         let sched2 = Scheduler::new(store2.clone(), SchedulerConfig::default());
 
-        // Run recovery reconciler
         sched2.recover_state().unwrap();
 
-        // Job 1 should have been reaped from expired lease and moved to RETRYING
         let state_j1 = store2.get_job(&job_id_1).unwrap().unwrap();
         assert_eq!(state_j1.status, JobStatus::Retrying);
         assert_eq!(state_j1.retry_count, 1);
 
-        // Job 2 should still be QUEUED
         let state_j2 = store2.get_job(&job_id_2).unwrap().unwrap();
         assert_eq!(state_j2.status, JobStatus::Queued);
     }

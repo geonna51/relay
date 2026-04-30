@@ -19,7 +19,6 @@ async fn test_batch_single_large_job_saturation() -> Result<(), Box<dyn std::err
         },
     );
 
-    // Submit 3 jobs that each request 4 CPUs and 2048 MB RAM
     for i in 0..3 {
         scheduler.submit_job(SubmitJobRequest {
             command: format!("echo job-{}", i),
@@ -39,7 +38,6 @@ async fn test_batch_single_large_job_saturation() -> Result<(), Box<dyn std::err
         })?;
     }
 
-    // A worker with 4 CPUs and 4096 MB polls with max_jobs = 4
     let capacity = WorkerCapacity {
         cpus: 4,
         memory_mb: 4096,
@@ -47,8 +45,6 @@ async fn test_batch_single_large_job_saturation() -> Result<(), Box<dyn std::err
     };
 
     let claimed = store.claim_jobs("worker-4cpu", &capacity, 4, Duration::from_secs(10))?;
-
-    // Because the worker only has 4 CPUs, it must receive EXACTLY 1 job, NOT all 3!
     assert_eq!(
         claimed.len(),
         1,
@@ -71,7 +67,6 @@ async fn test_batch_multiple_fitting_jobs() -> Result<(), Box<dyn std::error::Er
         },
     );
 
-    // Submit two 2-CPU jobs and one 4-CPU job
     let j1 = scheduler.submit_job(SubmitJobRequest {
         command: "echo job-2cpu-1".to_string(),
         args: vec![],
@@ -123,7 +118,6 @@ async fn test_batch_multiple_fitting_jobs() -> Result<(), Box<dyn std::error::Er
         name: Some("res-extra".to_string()),
     })?;
 
-    // A worker with 4 CPUs polls: should claim both 2-CPU jobs (2 + 2 = 4 CPUs), and stop
     let capacity = WorkerCapacity {
         cpus: 4,
         memory_mb: 4096,

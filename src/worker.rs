@@ -69,6 +69,28 @@ impl Drop for ResourceGuard {
     }
 }
 
+struct LeaseRenewalGuard {
+    active: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LeaseRenewalGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Relaxed);
+        self.handle.abort();
+    }
+}
+
+struct TaskAbortGuard<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> Drop for TaskAbortGuard<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 pub struct WorkerDaemon {
     config: WorkerConfig,
     client: Client,
@@ -312,6 +334,11 @@ impl WorkerDaemon {
             })
         };
 
+        let _renew_guard = LeaseRenewalGuard {
+            active: Arc::clone(&lease_active),
+            handle: renew_handle,
+        };
+
         let log_path = Path::new(&output_dir).join(format!("out.{}", job.id));
         let log_file = match File::create(&log_path) {
             Ok(mut f) => {
@@ -402,6 +429,9 @@ impl WorkerDaemon {
                     None
                 };
 
+                let mut stdout_guard = stdout_task.map(|h| TaskAbortGuard(Some(h)));
+                let mut stderr_guard = stderr_task.map(|h| TaskAbortGuard(Some(h)));
+
                 let wait_res = if let Some(timeout) = timeout_duration {
                     match tokio::time::timeout(timeout, child.wait()).await {
                         Ok(res) => res,
@@ -418,11 +448,15 @@ impl WorkerDaemon {
                     child.wait().await
                 };
 
-                if let Some(t) = stdout_task {
-                    let _ = t.await;
+                if let Some(ref mut g) = stdout_guard {
+                    if let Some(t) = g.0.take() {
+                        let _ = t.await;
+                    }
                 }
-                if let Some(t) = stderr_task {
-                    let _ = t.await;
+                if let Some(ref mut g) = stderr_guard {
+                    if let Some(t) = g.0.take() {
+                        let _ = t.await;
+                    }
                 }
 
                 let code = match wait_res {
@@ -453,9 +487,6 @@ impl WorkerDaemon {
         };
 
         let runtime_ms = start_time.elapsed().as_millis() as u64;
-
-        lease_active.store(false, Ordering::Relaxed);
-        renew_handle.abort();
 
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
             let _ = writeln!(f, "\n--- END OF OUTPUT ---");

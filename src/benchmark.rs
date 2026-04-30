@@ -121,13 +121,11 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, B
     let total_duration = start_time.elapsed();
     let throughput = config.num_jobs as f64 / total_duration.as_secs_f64();
 
-    // Calculate submission latencies (SQLite insertion duration)
     submit_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let submit_p50_ms = percentile(&submit_latencies, 0.50);
     let submit_p95_ms = percentile(&submit_latencies, 0.95);
     let submit_p99_ms = percentile(&submit_latencies, 0.99);
 
-    // Calculate true scheduling latencies (submission timestamp until worker assignment)
     let jobs = store.list_jobs(None, config.num_jobs + 100)?;
     let mut sched_latencies = Vec::with_capacity(jobs.len());
     for job in &jobs {
