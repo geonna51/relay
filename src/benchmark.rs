@@ -3,6 +3,7 @@ use crate::models::SubmitJobRequest;
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::store::Store;
 use crate::worker::{WorkerConfig, WorkerDaemon};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
@@ -22,15 +23,29 @@ impl Default for BenchmarkConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub jobs: usize,
     pub workers: usize,
     pub total_duration: Duration,
     pub throughput_jobs_per_sec: f64,
+    pub submit_p50_ms: f64,
+    pub submit_p95_ms: f64,
+    pub submit_p99_ms: f64,
+    pub sched_p50_ms: f64,
+    pub sched_p95_ms: f64,
+    pub sched_p99_ms: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() as f64 * p) as usize).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 pub async fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Box<dyn std::error::Error + Send + Sync>> {
@@ -106,17 +121,31 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, B
     let total_duration = start_time.elapsed();
     let throughput = config.num_jobs as f64 / total_duration.as_secs_f64();
 
-    submit_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50_idx = (submit_latencies.len() as f64 * 0.50) as usize;
-    let p95_idx = (submit_latencies.len() as f64 * 0.95) as usize;
-    let p99_idx = (submit_latencies.len() as f64 * 0.99) as usize;
+    // Calculate submission latencies (SQLite insertion duration)
+    submit_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let submit_p50_ms = percentile(&submit_latencies, 0.50);
+    let submit_p95_ms = percentile(&submit_latencies, 0.95);
+    let submit_p99_ms = percentile(&submit_latencies, 0.99);
 
-    let p50_ms = submit_latencies.get(p50_idx).copied().unwrap_or(0.0);
-    let p95_ms = submit_latencies.get(p95_idx).copied().unwrap_or(0.0);
-    let p99_ms = submit_latencies.get(p99_idx).copied().unwrap_or(0.0);
+    // Calculate true scheduling latencies (submission timestamp until worker assignment)
+    let jobs = store.list_jobs(None, config.num_jobs + 100)?;
+    let mut sched_latencies = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        if let Some(lat) = job.scheduling_latency_ms {
+            sched_latencies.push(lat);
+        } else if let (Some(started), created) = (job.started_at, job.created_at) {
+            let lat = (started - created).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+            sched_latencies.push(lat);
+        }
+    }
+
+    sched_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sched_p50_ms = percentile(&sched_latencies, 0.50);
+    let sched_p95_ms = percentile(&sched_latencies, 0.95);
+    let sched_p99_ms = percentile(&sched_latencies, 0.99);
 
     for d in daemons {
-        d.stop();
+        d.kill();
     }
 
     Ok(BenchmarkReport {
@@ -124,8 +153,14 @@ pub async fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, B
         workers: config.num_workers,
         total_duration,
         throughput_jobs_per_sec: throughput,
-        p50_ms,
-        p95_ms,
-        p99_ms,
+        submit_p50_ms,
+        submit_p95_ms,
+        submit_p99_ms,
+        sched_p50_ms,
+        sched_p95_ms,
+        sched_p99_ms,
+        p50_ms: sched_p50_ms,
+        p95_ms: sched_p95_ms,
+        p99_ms: sched_p99_ms,
     })
 }

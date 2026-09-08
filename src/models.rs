@@ -83,7 +83,6 @@ impl Priority {
     }
 
     pub fn effective_score(&self, queued_duration_secs: f64) -> f64 {
-        // Priority aging prevents low priority jobs from starving during high load
         self.as_i32() as f64 + (queued_duration_secs / 60.0) * 0.5
     }
 }
@@ -216,6 +215,7 @@ pub struct Job {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub runtime_ms: Option<u64>,
+    pub scheduling_latency_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,7 +253,6 @@ pub struct Lease {
     pub expires_at: DateTime<Utc>,
 }
 
-// Request & Response DTOs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitJobRequest {
     pub command: String,
@@ -387,11 +386,7 @@ mod tests {
         let low = Priority::Low;
         let high = Priority::High;
 
-        // Immediately, high priority beats low priority
         assert!(high.effective_score(0.0) > low.effective_score(0.0));
-
-        // After waiting 300 seconds (5 minutes), low priority gets 5 * 0.5 = 2.5 points boost
-        // Low: 1.0 + 2.5 = 3.5 > High at 0s (3.0)
         assert!(low.effective_score(300.0) > high.effective_score(0.0));
     }
 

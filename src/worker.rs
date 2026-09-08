@@ -2,13 +2,14 @@ use crate::models::{
     AssignedJob, CompleteJobRequest, CompleteJobResponse, RenewLeaseRequest, WorkerPollRequest,
     WorkerPollResponse, WorkerRegisterRequest,
 };
+use chrono::Utc;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use tokio::process::Command;
@@ -54,10 +55,27 @@ impl Default for WorkerConfig {
     }
 }
 
+struct ResourceGuard {
+    cpus: u32,
+    memory_mb: u64,
+    allocated_cpus: Arc<AtomicU32>,
+    allocated_memory_mb: Arc<AtomicU64>,
+}
+
+impl Drop for ResourceGuard {
+    fn drop(&mut self) {
+        self.allocated_cpus.fetch_sub(self.cpus, Ordering::SeqCst);
+        self.allocated_memory_mb.fetch_sub(self.memory_mb, Ordering::SeqCst);
+    }
+}
+
 pub struct WorkerDaemon {
     config: WorkerConfig,
     client: Client,
     running: Arc<AtomicBool>,
+    allocated_cpus: Arc<AtomicU32>,
+    allocated_memory_mb: Arc<AtomicU64>,
+    active_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl WorkerDaemon {
@@ -69,6 +87,9 @@ impl WorkerDaemon {
                 .build()
                 .expect("Failed to create HTTP client"),
             running: Arc::new(AtomicBool::new(true)),
+            allocated_cpus: Arc::new(AtomicU32::new(0)),
+            allocated_memory_mb: Arc::new(AtomicU64::new(0)),
+            active_tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -88,7 +109,7 @@ impl WorkerDaemon {
         let heartbeat_interval = self.config.heartbeat_interval;
         let client = self.client.clone();
 
-        tokio::spawn(async move {
+        let heartbeat_handle = tokio::spawn(async move {
             while heartbeat_running.load(Ordering::Relaxed) {
                 sleep(heartbeat_interval).await;
                 let url = format!("{}/workers/{}/heartbeat", heartbeat_url, heartbeat_worker_id);
@@ -98,18 +119,28 @@ impl WorkerDaemon {
             }
         });
 
+        {
+            let mut tasks = self.active_tasks.lock().unwrap();
+            tasks.push(heartbeat_handle);
+        }
+
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_jobs));
 
         while self.running.load(Ordering::Relaxed) {
             let available_permits = semaphore.available_permits();
-            if available_permits == 0 {
+            let cur_cpus = self.allocated_cpus.load(Ordering::Relaxed);
+            let cur_mem = self.allocated_memory_mb.load(Ordering::Relaxed);
+            let avail_cpus = self.config.cpus.saturating_sub(cur_cpus);
+            let avail_mem = self.config.memory_mb.saturating_sub(cur_mem);
+
+            if available_permits == 0 || avail_cpus == 0 {
                 sleep(self.config.poll_interval).await;
                 continue;
             }
 
             let poll_req = WorkerPollRequest {
-                available_cpus: self.config.cpus,
-                available_memory_mb: self.config.memory_mb,
+                available_cpus: avail_cpus,
+                available_memory_mb: avail_mem,
                 labels: self.config.labels.clone(),
                 max_jobs: available_permits.min(4),
             };
@@ -147,6 +178,13 @@ impl WorkerDaemon {
                     Err(_) => break,
                 };
 
+                let req_cpus = assigned.job.resources.cpus;
+                let req_mem = assigned.job.resources.memory_mb;
+                self.allocated_cpus.fetch_add(req_cpus, Ordering::SeqCst);
+                self.allocated_memory_mb.fetch_add(req_mem, Ordering::SeqCst);
+
+                let allocated_cpus = Arc::clone(&self.allocated_cpus);
+                let allocated_memory_mb = Arc::clone(&self.allocated_memory_mb);
                 let client = self.client.clone();
                 let server_url = self.config.scheduler_url.clone();
                 let worker_id = self.config.worker_id.clone();
@@ -154,6 +192,12 @@ impl WorkerDaemon {
                 let renew_interval = self.config.renew_interval;
 
                 if self.config.oneshot {
+                    let _guard = ResourceGuard {
+                        cpus: req_cpus,
+                        memory_mb: req_mem,
+                        allocated_cpus: Arc::clone(&allocated_cpus),
+                        allocated_memory_mb: Arc::clone(&allocated_memory_mb),
+                    };
                     Self::execute_job(
                         client,
                         server_url,
@@ -168,7 +212,13 @@ impl WorkerDaemon {
                     return Ok(());
                 }
 
-                tokio::spawn(async move {
+                let job_handle = tokio::spawn(async move {
+                    let _guard = ResourceGuard {
+                        cpus: req_cpus,
+                        memory_mb: req_mem,
+                        allocated_cpus,
+                        allocated_memory_mb,
+                    };
                     Self::execute_job(
                         client,
                         server_url,
@@ -180,6 +230,12 @@ impl WorkerDaemon {
                     .await;
                     drop(permit);
                 });
+
+                {
+                    let mut tasks = self.active_tasks.lock().unwrap();
+                    tasks.retain(|h| !h.is_finished());
+                    tasks.push(job_handle);
+                }
             }
         }
 
@@ -188,6 +244,14 @@ impl WorkerDaemon {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+
+    pub fn kill(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        let mut tasks = self.active_tasks.lock().unwrap();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
     }
 
     async fn register(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -248,9 +312,28 @@ impl WorkerDaemon {
             })
         };
 
+        let log_path = Path::new(&output_dir).join(format!("out.{}", job.id));
+        let log_file = match File::create(&log_path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "=== Job ID: {} (Attempt: {}) ===", job.id, attempt_id);
+                let _ = writeln!(f, "=== Command: {} ===", job.command);
+                let _ = writeln!(f, "=== Started At: {} ===\n", Utc::now().to_rfc3339());
+                let _ = writeln!(f, "--- LIVE OUTPUT ---");
+                let _ = f.flush();
+                Some(f)
+            }
+            Err(e) => {
+                warn!("Could not create log file at {:?}: {}", log_path, e);
+                None
+            }
+        };
+
         let start_time = Instant::now();
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&job.command);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
 
         if let Some(ref cwd) = job.cwd {
             cmd.current_dir(cwd);
@@ -262,19 +345,111 @@ impl WorkerDaemon {
 
         let timeout_duration = job.timeout_seconds.map(Duration::from_secs);
 
-        let execution_result = if let Some(timeout) = timeout_duration {
-            match tokio::time::timeout(timeout, cmd.output()).await {
-                Ok(res) => res,
-                Err(_) => {
-                    warn!("Job {} exceeded timeout of {:?}", job.id, timeout);
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Job execution timed out",
-                    ))
+        let (exit_code, stdout_str, stderr_str) = match cmd.spawn() {
+            Ok(mut child) => {
+                use tokio::io::AsyncBufReadExt;
+                let log_file_mutex = Arc::new(std::sync::Mutex::new(log_file));
+                let stdout_buf = Arc::new(std::sync::Mutex::new(String::new()));
+                let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
+
+                let stdout_task = if let Some(stdout) = child.stdout.take() {
+                    let file = Arc::clone(&log_file_mutex);
+                    let buf = Arc::clone(&stdout_buf);
+                    Some(tokio::spawn(async move {
+                        let reader = tokio::io::BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if let Ok(mut guard) = file.lock() {
+                                if let Some(ref mut f) = *guard {
+                                    let _ = writeln!(f, "{}", line);
+                                    let _ = f.flush();
+                                }
+                            }
+                            if let Ok(mut s) = buf.lock() {
+                                if s.len() < 1024 * 512 {
+                                    s.push_str(&line);
+                                    s.push('\n');
+                                }
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                };
+
+                let stderr_task = if let Some(stderr) = child.stderr.take() {
+                    let file = Arc::clone(&log_file_mutex);
+                    let buf = Arc::clone(&stderr_buf);
+                    Some(tokio::spawn(async move {
+                        let reader = tokio::io::BufReader::new(stderr);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if let Ok(mut guard) = file.lock() {
+                                if let Some(ref mut f) = *guard {
+                                    let _ = writeln!(f, "[STDERR] {}", line);
+                                    let _ = f.flush();
+                                }
+                            }
+                            if let Ok(mut s) = buf.lock() {
+                                if s.len() < 1024 * 512 {
+                                    s.push_str(&line);
+                                    s.push('\n');
+                                }
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                };
+
+                let wait_res = if let Some(timeout) = timeout_duration {
+                    match tokio::time::timeout(timeout, child.wait()).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            warn!("Job {} exceeded timeout of {:?}", job.id, timeout);
+                            let _ = child.kill().await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Job execution timed out",
+                            ))
+                        }
+                    }
+                } else {
+                    child.wait().await
+                };
+
+                if let Some(t) = stdout_task {
+                    let _ = t.await;
                 }
+                if let Some(t) = stderr_task {
+                    let _ = t.await;
+                }
+
+                let code = match wait_res {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(e) => {
+                        if let Ok(mut guard) = log_file_mutex.lock() {
+                            if let Some(ref mut f) = *guard {
+                                let _ = writeln!(f, "\n[ERROR] {}", e);
+                                let _ = f.flush();
+                            }
+                        }
+                        -1
+                    }
+                };
+
+                let out_str = stdout_buf.lock().map(|s| s.clone()).unwrap_or_default();
+                let mut err_str = stderr_buf.lock().map(|s| s.clone()).unwrap_or_default();
+                if code != 0 && err_str.is_empty() {
+                    err_str = format!("Process exited with code {}", code);
+                }
+
+                (code, out_str, err_str)
             }
-        } else {
-            cmd.output().await
+            Err(e) => {
+                let err_msg = format!("Failed to spawn process: {}", e);
+                (-1, String::new(), err_msg)
+            }
         };
 
         let runtime_ms = start_time.elapsed().as_millis() as u64;
@@ -282,25 +457,11 @@ impl WorkerDaemon {
         lease_active.store(false, Ordering::Relaxed);
         renew_handle.abort();
 
-        let (exit_code, stdout_str, stderr_str) = match execution_result {
-            Ok(output) => {
-                let code = output.status.code().unwrap_or(-1);
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                (code, stdout, stderr)
-            }
-            Err(e) => (-1, String::new(), format!("Execution error: {}", e)),
-        };
-
-        let log_path = Path::new(&output_dir).join(format!("out.{}", job.id));
-        if let Ok(mut f) = File::create(&log_path) {
-            let _ = writeln!(f, "=== Job ID: {} (Attempt: {}) ===", job.id, attempt_id);
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+            let _ = writeln!(f, "\n--- END OF OUTPUT ---");
             let _ = writeln!(f, "=== Exit Code: {} ===", exit_code);
-            let _ = writeln!(f, "=== Runtime: {}ms ===\n", runtime_ms);
-            let _ = writeln!(f, "--- STDOUT ---");
-            let _ = f.write_all(stdout_str.as_bytes());
-            let _ = writeln!(f, "\n--- STDERR ---");
-            let _ = f.write_all(stderr_str.as_bytes());
+            let _ = writeln!(f, "=== Runtime: {}ms ===", runtime_ms);
+            let _ = f.flush();
         }
 
         let complete_req = CompleteJobRequest {

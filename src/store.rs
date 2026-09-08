@@ -50,6 +50,7 @@ fn row_to_job(row: &rusqlite::Row) -> Result<Job, rusqlite::Error> {
     let lease_str: Option<String> = row.get(18)?;
     let retry_str: Option<String> = row.get(19)?;
     let runtime_ms: Option<i64> = row.get(23)?;
+    let scheduling_latency_ms: Option<f64> = row.get(24)?;
 
     let args = serde_json::from_str(&args_str).unwrap_or_default();
     let env = serde_json::from_str(&env_str).unwrap_or_default();
@@ -98,6 +99,7 @@ fn row_to_job(row: &rusqlite::Row) -> Result<Job, rusqlite::Error> {
         stdout: row.get(21)?,
         stderr: row.get(22)?,
         runtime_ms: runtime_ms.map(|v| v as u64),
+        scheduling_latency_ms,
     })
 }
 
@@ -183,7 +185,8 @@ impl Store {
                 exit_code INTEGER,
                 stdout TEXT,
                 stderr TEXT,
-                runtime_ms INTEGER
+                runtime_ms INTEGER,
+                scheduling_latency_ms REAL
             );
 
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -244,8 +247,9 @@ impl Store {
                 id, name, command, args, cwd, env, priority, status,
                 max_retries, retry_count, timeout_seconds, resources, depends_on,
                 worker_id, current_attempt_id, created_at, started_at, completed_at,
-                lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms,
+                scheduling_latency_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 command=excluded.command,
@@ -268,7 +272,8 @@ impl Store {
                 exit_code=excluded.exit_code,
                 stdout=excluded.stdout,
                 stderr=excluded.stderr,
-                runtime_ms=excluded.runtime_ms",
+                runtime_ms=excluded.runtime_ms,
+                scheduling_latency_ms=excluded.scheduling_latency_ms",
             params![
                 job.id,
                 job.name,
@@ -294,6 +299,7 @@ impl Store {
                 job.stdout,
                 job.stderr,
                 job.runtime_ms.map(|v| v as i64),
+                job.scheduling_latency_ms,
             ],
         )?;
         Ok(())
@@ -305,7 +311,8 @@ impl Store {
             "SELECT id, name, command, args, cwd, env, priority, status,
                     max_retries, retry_count, timeout_seconds, resources, depends_on,
                     worker_id, current_attempt_id, created_at, started_at, completed_at,
-                    lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms
+                    lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms,
+                    scheduling_latency_ms
              FROM jobs WHERE id = ?1",
         )?;
 
@@ -322,7 +329,8 @@ impl Store {
         let mut sql = "SELECT id, name, command, args, cwd, env, priority, status,
                               max_retries, retry_count, timeout_seconds, resources, depends_on,
                               worker_id, current_attempt_id, created_at, started_at, completed_at,
-                              lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms
+                              lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms,
+                              scheduling_latency_ms
                        FROM jobs".to_string();
 
         if let Some(st) = status {
@@ -357,7 +365,8 @@ impl Store {
             "SELECT id, name, command, args, cwd, env, priority, status,
                     max_retries, retry_count, timeout_seconds, resources, depends_on,
                     worker_id, current_attempt_id, created_at, started_at, completed_at,
-                    lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms
+                    lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms,
+                    scheduling_latency_ms
              FROM jobs
              WHERE status = 'QUEUED'
                 OR (status = 'RETRYING' AND (next_retry_at IS NULL OR next_retry_at <= ?1))",
@@ -388,8 +397,21 @@ impl Store {
 
         let mut claimed = Vec::new();
         let expires_at = now + ChronoDuration::from_std(lease_duration).unwrap();
+        let mut remaining_capacity = capacity.clone();
 
-        for (_, mut job) in scored_candidates.into_iter().take(max_jobs) {
+        for (_, mut job) in scored_candidates {
+            if claimed.len() >= max_jobs {
+                break;
+            }
+
+            // Real-time resource subtraction: skip candidates that exceed currently remaining capacity
+            if !remaining_capacity.satisfies(&job.resources) {
+                continue;
+            }
+
+            remaining_capacity.cpus = remaining_capacity.cpus.saturating_sub(job.resources.cpus);
+            remaining_capacity.memory_mb = remaining_capacity.memory_mb.saturating_sub(job.resources.memory_mb);
+
             let prev_attempts: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM job_attempts WHERE job_id = ?1",
                 params![job.id],
@@ -435,11 +457,13 @@ impl Store {
                 params![job.id, attempt.id, worker_id, expires_at.to_rfc3339()],
             )?;
 
+            let sched_latency = (now - job.created_at).num_microseconds().unwrap_or(0) as f64 / 1000.0;
             job.status = JobStatus::Assigned;
             job.worker_id = Some(worker_id.to_string());
             job.current_attempt_id = Some(attempt_id.clone());
             job.started_at = Some(now);
             job.lease_expires_at = Some(expires_at);
+            job.scheduling_latency_ms = Some(sched_latency);
 
             tx.execute(
                 "UPDATE jobs SET
@@ -447,13 +471,15 @@ impl Store {
                      worker_id = ?1,
                      current_attempt_id = ?2,
                      started_at = ?3,
-                     lease_expires_at = ?4
-                 WHERE id = ?5",
+                     lease_expires_at = ?4,
+                     scheduling_latency_ms = ?5
+                 WHERE id = ?6",
                 params![
                     worker_id,
                     attempt_id,
                     now.to_rfc3339(),
                     expires_at.to_rfc3339(),
+                    job.scheduling_latency_ms,
                     job.id,
                 ],
             )?;
@@ -518,7 +544,10 @@ impl Store {
             None => return Err(StoreError::JobNotFound(job_id.to_string())),
         };
 
-        if job.current_attempt_id.as_deref() != Some(attempt_id) {
+        if job.status.is_terminal()
+            || job.status == JobStatus::Cancelled
+            || job.current_attempt_id.as_deref() != Some(attempt_id)
+        {
             return Ok(CompleteJobOutcome::StaleAttemptIgnored);
         }
 
@@ -823,24 +852,36 @@ impl Store {
         }
 
         let now = Utc::now();
+        let prev_worker_id = job.worker_id.clone();
+        let prev_attempt_id = job.current_attempt_id.clone();
+
         job.status = JobStatus::Cancelled;
         job.completed_at = Some(now);
+        job.worker_id = None;
+        job.current_attempt_id = None;
+        job.lease_expires_at = None;
 
         tx.execute(
-            "UPDATE jobs SET status = 'CANCELLED', completed_at = ?1 WHERE id = ?2",
+            "UPDATE jobs SET
+                 status = 'CANCELLED',
+                 completed_at = ?1,
+                 worker_id = NULL,
+                 current_attempt_id = NULL,
+                 lease_expires_at = NULL
+             WHERE id = ?2",
             params![now.to_rfc3339(), job_id],
         )?;
 
         tx.execute("DELETE FROM leases WHERE job_id = ?1", params![job_id])?;
 
-        if let Some(ref wid) = job.worker_id {
+        if let Some(ref wid) = prev_worker_id {
             tx.execute(
                 "UPDATE workers SET active_jobs = MAX(0, active_jobs - 1) WHERE id = ?1",
                 params![wid],
             )?;
         }
 
-        if let Some(ref att) = job.current_attempt_id {
+        if let Some(ref att) = prev_attempt_id {
             tx.execute(
                 "UPDATE job_attempts SET status = 'CANCELLED', completed_at = ?1 WHERE id = ?2",
                 params![now.to_rfc3339(), att],
@@ -920,7 +961,8 @@ impl Store {
             "SELECT id, name, command, args, cwd, env, priority, status,
                     max_retries, retry_count, timeout_seconds, resources, depends_on,
                     worker_id, current_attempt_id, created_at, started_at, completed_at,
-                    lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms
+                    lease_expires_at, next_retry_at, exit_code, stdout, stderr, runtime_ms,
+                    scheduling_latency_ms
              FROM jobs WHERE id = ?1",
         )?;
 

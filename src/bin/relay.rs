@@ -433,13 +433,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let report = run_benchmark(cfg).await?;
             println!("\n=== Benchmark Results ===");
-            println!("Jobs:                {}", report.jobs);
-            println!("Workers:             {}", report.workers);
-            println!("Total Duration:      {:.2}s", report.total_duration.as_secs_f64());
-            println!("Throughput:          {:.1} jobs/sec", report.throughput_jobs_per_sec);
-            println!("Latency (p50):       {:.2} ms", report.p50_ms);
-            println!("Latency (p95):       {:.2} ms", report.p95_ms);
-            println!("Latency (p99):       {:.2} ms", report.p99_ms);
+            println!("Jobs:                     {}", report.jobs);
+            println!("Workers:                  {}", report.workers);
+            println!("Total Duration:           {:.2}s", report.total_duration.as_secs_f64());
+            println!("Throughput:               {:.1} jobs/sec", report.throughput_jobs_per_sec);
+            println!("Submission Latency (SQLite insert):");
+            println!("  p50:                    {:.2} ms", report.submit_p50_ms);
+            println!("  p95:                    {:.2} ms", report.submit_p95_ms);
+            println!("  p99:                    {:.2} ms", report.submit_p99_ms);
+            println!("Scheduling Latency (Submission -> Worker Assignment):");
+            println!("  p50:                    {:.2} ms", report.sched_p50_ms);
+            println!("  p95:                    {:.2} ms", report.sched_p95_ms);
+            println!("  p99:                    {:.2} ms", report.sched_p99_ms);
         }
     }
 

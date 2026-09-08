@@ -6,7 +6,9 @@ Relay provides **at-least-once execution**. This document details the invariants
 
 1. **Attempt ID Uniqueness**: Every assignment of a job to a worker generates a unique attempt identifier (`att-<uuid>`) with an incremented `attempt_number`.
 2. **Lease Exclusivity**: A job can have at most one active lease at any given moment.
-3. **Stale Completion Rejection**: The scheduler verifies that the `attempt_id` reported on completion matches `current_attempt_id`. Results from previous or expired attempts are rejected.
+3. **Stale Completion Rejection**: The scheduler verifies that the `attempt_id` reported on completion matches `current_attempt_id` and that the job is not in a terminal state (`CANCELLED`, `SUCCEEDED`, `FAILED`). Results from previous or expired attempts are rejected.
+4. **Dynamic Resource Budgeting**: Workers request tasks using only unallocated capacity. The scheduler decrements capacity per candidate claimed in a batch.
+5. **Real-time Log Persistence**: Child process stdout and stderr are piped and flushed line-by-line to disk in real time.
 
 ## State Machine
 
@@ -70,6 +72,19 @@ Relay provides **at-least-once execution**. This document details the invariants
 - The scheduler detects that `attempt_id` does not match `job.current_attempt_id`.
 - The scheduler ignores Worker A's report and returns `{ "status": "stale_ignored" }`.
 - Worker B finishes Attempt 2 and records the official completion.
+
+### Cancellation Race Condition
+- Worker A is actively running job 123 (Attempt 1).
+- The user issues `relay cancel 123`.
+- The scheduler:
+  1. Transitions job 123 to `CANCELLED`.
+  2. Removes the active lease.
+  3. Sets `current_attempt_id = NULL` and `worker_id = NULL`.
+  4. Marks Attempt 1 as `CANCELLED`.
+- If Worker A's subprocess finishes later and posts a completion request to `/jobs/123/complete`:
+  1. The scheduler checks `job.status.is_terminal()` and `current_attempt_id`.
+  2. Because the job is already `CANCELLED` and `current_attempt_id` is cleared, the scheduler returns `{ "status": "stale_ignored" }`.
+  3. The job remains `CANCELLED` and is never overwritten with `SUCCEEDED` or `FAILED`.
 
 ### Non-Zero Exit Code and Retries
 - If a command terminates with a non-zero exit code and `retry_count < max_retries`, the job transitions to `RETRYING`.
