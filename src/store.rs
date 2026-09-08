@@ -404,7 +404,6 @@ impl Store {
                 break;
             }
 
-            // Real-time resource subtraction: skip candidates that exceed currently remaining capacity
             if !remaining_capacity.satisfies(&job.resources) {
                 continue;
             }

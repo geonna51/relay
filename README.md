@@ -177,7 +177,7 @@ Relay includes a chaos test runner that simulates random worker crashes during a
 
 ## Benchmarks
 
-Measured on Apple M3 Pro (12 cores, 18 GB RAM), macOS 15, build target `release`:
+Measured on Apple M2 Pro (12 cores, 16 GB RAM), macOS 26.6.2, build target `release`:
 
 ```bash
 ./target/release/relay benchmark --jobs 1000 --workers 8
@@ -189,13 +189,13 @@ Results distinguish between **Submission Latency** (local SQLite persistence tim
 | :--- | :--- |
 | Workload | 1,000 POSIX subprocess tasks |
 | Workers | 8 local worker daemons |
-| Throughput | 1,158 jobs/sec |
+| Throughput | 1,173.1 jobs/sec |
 | Submission Latency (p50) | 0.17 ms |
-| Submission Latency (p95) | 2.92 ms |
-| Submission Latency (p99) | 13.95 ms |
-| Scheduling Latency (p50) | 5.55 ms |
-| Scheduling Latency (p95) | 24.18 ms |
-| Scheduling Latency (p99) | 26.36 ms |
+| Submission Latency (p95) | 4.59 ms |
+| Submission Latency (p99) | 11.77 ms |
+| Scheduling Latency (p50) | 3.62 ms |
+| Scheduling Latency (p95) | 10.74 ms |
+| Scheduling Latency (p99) | 16.29 ms |
 | Worker Failures Requeued | Handled with 0 lost jobs |
 
 ## Limitations

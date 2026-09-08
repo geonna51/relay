@@ -15,7 +15,6 @@ async fn test_dag_dependency_resolution() {
     let sched_config = SchedulerConfig::default();
     let scheduler = Scheduler::new(store.clone(), sched_config);
 
-    // Submit Job A
     let job_a = scheduler
         .submit_job(SubmitJobRequest {
             command: "echo 'step a'".to_string(),
@@ -31,7 +30,6 @@ async fn test_dag_dependency_resolution() {
         })
         .unwrap();
 
-    // Submit Job B
     let job_b = scheduler
         .submit_job(SubmitJobRequest {
             command: "echo 'step b'".to_string(),
@@ -47,7 +45,6 @@ async fn test_dag_dependency_resolution() {
         })
         .unwrap();
 
-    // Submit Job C, depending on A and B
     let job_c = scheduler
         .submit_job(SubmitJobRequest {
             command: "echo 'step c'".to_string(),
@@ -63,7 +60,6 @@ async fn test_dag_dependency_resolution() {
         })
         .unwrap();
 
-    // Verify initial states
     assert_eq!(job_a.status, JobStatus::Queued);
     assert_eq!(job_b.status, JobStatus::Queued);
     assert_eq!(job_c.status, JobStatus::Blocked);
@@ -74,7 +70,6 @@ async fn test_dag_dependency_resolution() {
         labels: HashMap::new(),
     };
 
-    // Complete Job A
     let claimed_a = store.claim_jobs("worker-01", &cap, 1, Duration::from_secs(30)).unwrap();
     scheduler
         .complete_job(
@@ -89,11 +84,9 @@ async fn test_dag_dependency_resolution() {
         )
         .unwrap();
 
-    // Job C should still be BLOCKED (waiting for Job B)
     let c_state = store.get_job(&job_c.job_id).unwrap().unwrap();
     assert_eq!(c_state.status, JobStatus::Blocked);
 
-    // Complete Job B
     let claimed_b = store.claim_jobs("worker-01", &cap, 1, Duration::from_secs(30)).unwrap();
     scheduler
         .complete_job(
@@ -108,7 +101,6 @@ async fn test_dag_dependency_resolution() {
         )
         .unwrap();
 
-    // Job C should now be automatically UNBLOCKED to QUEUED!
     let c_state_unblocked = store.get_job(&job_c.job_id).unwrap().unwrap();
     assert_eq!(c_state_unblocked.status, JobStatus::Queued);
 }
